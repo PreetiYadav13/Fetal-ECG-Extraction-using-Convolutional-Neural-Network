@@ -1,0 +1,176 @@
+% Load data
+abdomen = edfread('r01.edf', 'SelectedSignals', 'Abdomen_1');
+abdomen_cellarray = table2array(abdomen);
+abdomen_array = vertcat(abdomen_cellarray{:});
+
+direct = edfread('r01.edf', 'SelectedSignals', 'Direct_1');
+direct_cellarray = table2array(direct);
+direct_array = vertcat(direct_cellarray{:});
+    
+fs = 1000;  % Sampling frequency
+
+% Bandpass filter design
+bpFilt = designfilt('bandpassiir', 'FilterOrder', 4, ...
+         'HalfPowerFrequency1', 3, 'HalfPowerFrequency2', 90, ...
+         'SampleRate', fs);
+
+% Apply the bandpass filter
+abdomen_array_filtered = filtfilt(bpFilt, abdomen_array);
+direct_array_filtered = filtfilt(bpFilt, direct_array);
+
+% Normalize filtered signals to the range [-1, 1]
+abdomen_array_filtered = abdomen_array_filtered / max(abs(abdomen_array_filtered));
+direct_array_filtered = direct_array_filtered / max(abs(direct_array_filtered));
+
+% Time vector for plotting
+signal_length = length(abdomen_array);
+time = (0:signal_length-1) / fs * 1000;  % Time in ms
+
+% Plot the normalized preprocessed signals
+figure;
+subplot(311);
+plot(time(1:10*fs), abdomen_array_filtered(1:10*fs));
+title('Preprocessed Abdominal ECG (Normalized)');
+xlabel('Time (ms)');
+ylabel('Amplitude (Normalized)');
+
+subplot(312);
+plot(time(1:10*fs), direct_array_filtered(1:10*fs));
+title('Preprocessed Direct Fetal ECG (Normalized)');
+xlabel('Time (ms)');
+ylabel('Amplitude (Normalized)');
+
+% Preprocess data for CNN
+window_size = 1000;  % 1 second window to reduce size
+overlap = 250;  % 25% overlap
+
+% Ensure equal lengths
+min_length = min(length(abdomen_array_filtered), length(direct_array_filtered));
+abdomen_array_filtered = abdomen_array_filtered(1:min_length);
+direct_array_filtered = direct_array_filtered(1:min_length);
+
+% Buffer the filtered signals
+X = buffer(abdomen_array_filtered, window_size, overlap, 'nodelay');
+Y = buffer(direct_array_filtered, window_size, overlap, 'nodelay');
+
+% Normalize X and Y buffers to [-1, 1]
+X = X / max(abs(X), [], 'all');
+Y = Y / max(abs(Y), [], 'all');
+
+% Reshape for CNN input
+num_windows = size(X, 2);  % Number of windows
+X = reshape(X, [window_size, 1, 1, num_windows]);  % Reshape to [1000, 1, 1, num_windows]
+Y = reshape(Y, [window_size, 1, 1, num_windows]);  % Match output shape
+
+% Split data into training and validation sets
+rng(1);  % For reproducibility
+cv = cvpartition(num_windows, 'HoldOut', 0.2);  % Adjust for number of windows
+X_train = X(:, :, :, cv.training);
+Y_train = Y(:, :, :, cv.training);
+X_val = X(:, :, :, cv.test);
+Y_val = Y(:, :, :, cv.test);
+
+% Define the simplified CNN architecture
+layers = [
+    imageInputLayer([window_size 1 1], 'Normalization', 'none')
+    
+    % First convolutional block with batch normalization and dropout
+    convolution2dLayer([7 1], 64, 'Padding', 'same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer([2 1], 'Stride', [2 1])
+
+    % Second convolutional block
+    convolution2dLayer([5 1], 128, 'Padding', 'same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer([2 1], 'Stride', [2 1])
+
+    % Third convolutional block
+    convolution2dLayer([3 1], 256, 'Padding', 'same')
+    batchNormalizationLayer
+    reluLayer
+    
+    % Upsampling block with skip connections
+    transposedConv2dLayer([3 1], 128, 'Stride', [2 1], 'Cropping', 'same')
+    reluLayer
+    
+    transposedConv2dLayer([5 1], 64, 'Stride', [2 1], 'Cropping', 'same')
+    reluLayer
+    
+    % Final layer with reduced filters for smoother output
+    transposedConv2dLayer([7 1], 1, 'Stride', [1 1], 'Cropping', 'same')
+    regressionLayer
+];
+
+% Adjust the training options for potentially better convergence
+options = trainingOptions('adam', ...
+    'MaxEpochs', 20, ...  % Increase epochs to allow more learning
+    'MiniBatchSize', 16, ...  % Larger batch size for smoother gradients
+    'ValidationData', {X_val, Y_val}, ...
+    'ValidationFrequency', 20, ...
+    'InitialLearnRate', 1e-4, ...  % Reduced learning rate for stability
+    'L2Regularization', 0.0001, ...  % Add slight regularization to avoid overfitting
+    'Verbose', false, ...
+    'Plots', 'training-progress');
+
+% Train the enhanced network
+net = trainNetwork(X_train, Y_train, layers, options);
+
+% Predict and post-process
+Y_pred = predict(net, X);
+Y_pred = reshape(Y_pred, [window_size, 1, 1, num_windows]);
+
+% Reconstruct the full signal from overlapping windows
+extracted_fecg = unbuffer(Y_pred, overlap);
+extracted_fecg = extracted_fecg(1:300000) / max(abs(extracted_fecg)); % Trim and normalize
+
+% Plot the updated extracted fetal ECG signal
+subplot(313);
+plot(time(1:10*fs), extracted_fecg(1:10*fs));
+title('Extracted Fetal ECG (Normalized)');
+xlabel('Time (ms)');
+ylabel('Amplitude (Normalized)');
+
+% Check and calculate correlation and MSE again
+fprintf('Length of extracted_fecg: %d\n', length(extracted_fecg));
+fprintf('Length of direct_array: %d\n', length(direct_array));
+
+% Ensure lengths match for correlation calculation
+if length(extracted_fecg) > length(direct_array)
+    extracted_fecg = extracted_fecg(1:length(direct_array));
+else
+    direct_array = direct_array(1:length(extracted_fecg));
+end
+
+% Normalize for fair comparison
+extracted_fecg = extracted_fecg / max(abs(extracted_fecg));
+direct_array = direct_array / max(abs(direct_array));
+
+% Calculate and display correlation and MSE
+correlation = corr(extracted_fecg, direct_array);
+mse = mean((extracted_fecg - direct_array).^2);
+
+fprintf('Correlation between extracted and direct fECG: %.4f\n', correlation);
+fprintf('Mean Squared Error: %.4f\n', mse);
+
+analyzeNetwork(layers);
+
+
+% Function to reconstruct signal from overlapping windows
+function reconstructed = unbuffer(Y, overlap)
+    [window_size, num_windows] = size(Y);
+    stride = window_size - overlap;
+    signal_length = (num_windows - 1) * stride + window_size;
+    reconstructed = zeros(signal_length, 1);
+    count = zeros(signal_length, 1);
+    
+    for i = 1:num_windows
+        start_idx = (i-1)*stride + 1;
+        end_idx = start_idx + window_size - 1;
+        reconstructed(start_idx:end_idx) = reconstructed(start_idx:end_idx) + Y(:,i);
+        count(start_idx:end_idx) = count(start_idx:end_idx) + 1;
+    end
+    
+    reconstructed = reconstructed ./ count;
+end
